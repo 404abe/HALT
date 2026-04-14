@@ -1,87 +1,47 @@
 from fastapi import FastAPI
-import feedparser
-import re
+from database import get_connection, create_tables
+from halt_scraper import fetch_and_store_halts
 from datetime import datetime, timedelta
 
 app = FastAPI()
 
-NASDAQ_TRADE_HALT_FEED_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+
+@app.on_event("startup")
+def startup():
+    create_tables()
 
 
-# ===== CLEAN HTML =====
-def remove_html_tags(text):
-    return re.sub("<.*?>", "", text or "")
+@app.get("/refresh")
+def refresh_data():
+    data = fetch_and_store_halts()
+    return {"inserted": len(data)}
 
 
-# ===== EXTRACT STRUCTURED DATA =====
-def extract_halt_fields(summary_html):
-    if not summary_html:
-        return {}
-
-    table_cells = re.findall(r"<td.*?>(.*?)</td>", summary_html)
-    table_cells = [remove_html_tags(cell).strip() for cell in table_cells]
-
-    if len(table_cells) < 6:
-        return {}
-
-    return {
-        "halt_date": table_cells[0],
-        "halt_time": table_cells[1],
-        "ticker": table_cells[2],
-        "company": table_cells[3],
-        "market": table_cells[4],
-        "reason": table_cells[5],
-    }
-
-
-# ===== FETCH DATA FROM FEED =====
-def fetch_halts():
-    feed = feedparser.parse(NASDAQ_TRADE_HALT_FEED_URL)
-
-    halt_results = []
-
-    for entry in feed.entries:
-        raw_summary_html = entry.get("summary", "")
-        parsed_halt_data = extract_halt_fields(raw_summary_html)
-
-        halt_results.append({
-            "ticker": parsed_halt_data.get("ticker"),
-            "company": parsed_halt_data.get("company"),
-            "reason": parsed_halt_data.get("reason"),
-            "halt_time": parsed_halt_data.get("halt_time"),
-            "halt_date": parsed_halt_data.get("halt_date"),
-            "market": parsed_halt_data.get("market"),
-            "timestamp": entry.get("published")
-        })
-
-    return halt_results
-
-
-# ===== API ROUTE =====
 @app.get("/halts")
 def get_halts(mode: str = "all"):
-    halt_data = fetch_halts()
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("SELECT * FROM halts ORDER BY id DESC")
+    rows = cursor.fetchall()
+
+    halts = [dict(row) for row in rows]
 
     if mode == "live":
-        return halt_data[:10]
+        return halts[:10]
 
     if mode == "24h":
-        cutoff_time = datetime.utcnow() - timedelta(days=1)
-        filtered_halts = []
+        cutoff = datetime.utcnow() - timedelta(days=1)
 
-        for halt in halt_data:
+        filtered = []
+        for h in halts:
             try:
-                parsed_timestamp = datetime.strptime(
-                    halt["timestamp"],
-                    "%a, %d %b %Y %H:%M:%S %Z"
-                )
-
-                if parsed_timestamp >= cutoff_time:
-                    filtered_halts.append(halt)
-
-            except Exception:
+                dt = datetime.strptime(h["timestamp"], "%a, %d %b %Y %H:%M:%S %Z")
+                if dt >= cutoff:
+                    filtered.append(h)
+            except:
                 continue
 
-        return filtered_halts
+        return filtered
 
-    return halt_data
+    return halts
